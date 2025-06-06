@@ -4,10 +4,9 @@ from pydantic import BaseModel
 import base64
 import io
 import os
-import gc
-import torch
+import subprocess
+import tempfile
 from PIL import Image
-import numpy as np
 from typing import Optional
 import logging
 
@@ -16,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AI Image Upscaler",
-    description="Lightweight AI image upscaling service with Real-ESRGAN and NCNN fallback",
+    description="Lightweight AI image upscaling service with Real-ESRGAN-ncnn-vulkan",
     version="1.0.0"
 )
 
@@ -26,66 +25,72 @@ class Base64Request(BaseModel):
 
 class UpscalerService:
     def __init__(self):
-        self.realesrgan_model = None
-        self.ncnn_model = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._init_models()
+        self.realesrgan_binary = "/app/realesrgan-ncnn-vulkan"
+        self.models_path = "/app/models"
+        self.temp_dir = "/tmp"
+        self._check_binary()
     
-    def _init_models(self):
-        try:
-            from realesrgan import RealESRGANer
-            from basicsr.archs.rrdbnet_arch import RRDBNet
-            
-            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-            self.realesrgan_model = RealESRGANer(
-                scale=4,
-                model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',
-                model=model,
-                tile=400,
-                tile_pad=10,
-                pre_pad=0,
-                half=True if self.device == "cuda" else False,
-                device=self.device
-            )
-            logger.info("Real-ESRGAN model loaded successfully")
-        except Exception as e:
-            logger.warning(f"Failed to load Real-ESRGAN: {e}")
-            self._init_ncnn_fallback()
-    
-    def _init_ncnn_fallback(self):
-        try:
-            import ncnn
-            logger.info("Initializing NCNN fallback")
-            self.ncnn_model = True
-        except Exception as e:
-            logger.error(f"Failed to initialize NCNN fallback: {e}")
-            raise HTTPException(status_code=500, detail="No upscaling models available")
+    def _check_binary(self):
+        if not os.path.exists(self.realesrgan_binary):
+            logger.warning("Real-ESRGAN-ncnn-vulkan binary not found")
+            self.realesrgan_binary = None
+        else:
+            logger.info("Real-ESRGAN-ncnn-vulkan binary found")
     
     def upscale_image(self, image: Image.Image, scale: int = 4) -> Image.Image:
         try:
-            if self.realesrgan_model:
-                return self._upscale_realesrgan(image, scale)
-            elif self.ncnn_model:
+            if self.realesrgan_binary:
                 return self._upscale_ncnn(image, scale)
             else:
-                raise HTTPException(status_code=500, detail="No upscaling models available")
+                return self._upscale_fallback(image, scale)
         except Exception as e:
-            logger.error(f"Upscaling failed: {e}")
-            if self.ncnn_model and self.realesrgan_model:
-                logger.info("Falling back to NCNN")
-                return self._upscale_ncnn(image, scale)
-            raise HTTPException(status_code=500, detail="Upscaling failed")
-    
-    def _upscale_realesrgan(self, image: Image.Image, scale: int) -> Image.Image:
-        img_np = np.array(image)
-        output, _ = self.realesrgan_model.enhance(img_np, outscale=scale)
-        
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        return Image.fromarray(output)
+            logger.error(f"Real-ESRGAN-ncnn upscaling failed: {e}")
+            logger.info("Falling back to simple upscaling")
+            return self._upscale_fallback(image, scale)
     
     def _upscale_ncnn(self, image: Image.Image, scale: int) -> Image.Image:
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as input_file:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as output_file:
+                try:
+                    image.save(input_file.name, 'PNG')
+                    
+                    model_name = self._get_model_name(scale)
+                    
+                    cmd = [
+                        self.realesrgan_binary,
+                        "-i", input_file.name,
+                        "-o", output_file.name,
+                        "-n", model_name,
+                        "-s", str(scale),
+                        "-f", "png"
+                    ]
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                    
+                    if result.returncode != 0:
+                        logger.error(f"Real-ESRGAN-ncnn failed: {result.stderr}")
+                        raise Exception("NCNN processing failed")
+                    
+                    if os.path.exists(output_file.name):
+                        upscaled_image = Image.open(output_file.name)
+                        return upscaled_image.copy()
+                    else:
+                        raise Exception("Output file not created")
+                        
+                finally:
+                    for temp_file in [input_file.name, output_file.name]:
+                        if os.path.exists(temp_file):
+                            os.unlink(temp_file)
+    
+    def _get_model_name(self, scale: int) -> str:
+        model_map = {
+            2: "realesr-animevideov3",
+            4: "realesrgan-x4plus",
+            8: "realesrgan-x4plus"
+        }
+        return model_map.get(scale, "realesrgan-x4plus")
+    
+    def _upscale_fallback(self, image: Image.Image, scale: int) -> Image.Image:
         width, height = image.size
         new_size = (width * scale, height * scale)
         return image.resize(new_size, Image.LANCZOS)
@@ -120,7 +125,11 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "device": upscaler.device}
+    return {
+        "status": "healthy", 
+        "engine": "Real-ESRGAN-ncnn-vulkan" if upscaler.realesrgan_binary else "Fallback",
+        "binary_found": upscaler.realesrgan_binary is not None
+    }
 
 @app.post("/upscale/binary")
 async def upscale_binary(file: UploadFile = File(...), scale: int = 4):

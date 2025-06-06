@@ -4,29 +4,27 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
     wget \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
+    unzip \
+    libvulkan1 \
     libgomp1 \
-    libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r requirements.txt
 
-RUN mkdir -p /app/models && \
-    wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth \
-    -O /app/models/RealESRGAN_x4plus.pth
+RUN mkdir -p /app/models
+
+RUN wget -q https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/releases/download/v0.2.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip && \
+    unzip realesrgan-ncnn-vulkan-20220424-ubuntu.zip && \
+    mv realesrgan-ncnn-vulkan-20220424-ubuntu/realesrgan-ncnn-vulkan /app/ && \
+    mv realesrgan-ncnn-vulkan-20220424-ubuntu/models/* /app/models/ && \
+    chmod +x /app/realesrgan-ncnn-vulkan && \
+    rm -rf realesrgan-ncnn-vulkan-20220424-ubuntu* 
 
 COPY app.py .
 
 ENV PYTHONPATH=/app
-ENV TORCH_HOME=/app/models
-ENV REALESRGAN_MODEL_PATH=/app/models/RealESRGAN_x4plus.pth
 
 EXPOSE 8000
 
